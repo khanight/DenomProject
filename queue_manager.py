@@ -18,9 +18,16 @@ from typing import TYPE_CHECKING, Optional
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
-import book
 import config
-from executors import run_book_task, run_claude_cli, run_desktop_task, run_text_task
+import workspace
+from executors import (
+    run_claude_cli,
+    run_desktop_task,
+    run_dev_task,
+    run_research_task,
+    run_text_task,
+    run_workspace_task,
+)
 from memory import conversation_memory
 from router import route_command
 from schemas import RouteDecision
@@ -42,8 +49,16 @@ class TaskItem:
     # Set by explicit slash commands (e.g. /write, /brainstorm) to skip Ollama
     # triage entirely and dispatch straight to a known route.
     forced_route: Optional[str] = None
-    # Only meaningful when forced_route == "claude_book": "write" or "brainstorm".
-    book_mode: Optional[str] = None
+    # Only meaningful when forced_route == "claude_project": "write",
+    # "brainstorm", "braindump", or "keep".
+    project_mode: Optional[str] = None
+    # The project name active at enqueue time — used by both
+    # forced_route == "claude_project" and "claude_research".
+    project: Optional[str] = None
+    # Only meaningful when project_mode == "write": the target file within `project`.
+    target_file: Optional[str] = None
+    # Only meaningful when forced_route == "claude_dev": "fix" or "code".
+    dev_mode: Optional[str] = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -234,11 +249,16 @@ class TaskQueue:
         if item.forced_route:
             # Explicit slash command (e.g. /write, /brainstorm) — bypass Ollama
             # triage entirely and dispatch straight to the known route.
+            command_label = (
+                item.project_mode
+                or item.dev_mode
+                or ("research" if item.forced_route == "claude_research" else item.forced_route)
+            )
             decision = RouteDecision(
                 route=item.forced_route,
                 model="claude-sonnet",
                 task=item.user_prompt,
-                rationale=f"Explicit /{item.book_mode or item.forced_route} command — routing skipped.",
+                rationale=f"Explicit /{command_label} command — routing skipped.",
                 risky=False,
             )
             await edit_status_message(
@@ -246,7 +266,7 @@ class TaskQueue:
                 chat_id=chat_id,
                 message_id=status_message_id,
                 text=(
-                    f"📖 Route: `{decision.route}` (explicit command)\n\n"
+                    f"🧠 Route: `{decision.route}` (explicit command)\n\n"
                     f"▶️ Executing..."
                 ),
             )
@@ -281,20 +301,57 @@ class TaskQueue:
                 chat_id=chat_id,
                 message_id=status_message_id,
             )
-        elif decision.route == "claude_book":
-            book_mode = item.book_mode or "auto"
-            output, success = await run_book_task(
+        elif decision.route == "claude_project":
+            # item.project is set when an explicit /write, /brainstorm,
+            # /braindump, or /keep command enqueued this; for a natural-
+            # language message (no forced_route), fall back to whatever
+            # project is currently active for this chat.
+            project = item.project or workspace.get_active_project(chat_id)
+            if project is None:
+                output, success = (workspace.no_active_project_message(), False)
+            else:
+                project_mode = item.project_mode or "auto"
+                output, success = await run_workspace_task(
+                    task=decision.task,
+                    project=project,
+                    mode=project_mode,
+                    target_file=item.target_file,
+                    status_callback=status_callback,
+                    model=decision.model,
+                    chat_id=chat_id,
+                    message_id=status_message_id,
+                )
+                if project_mode == "brainstorm" and success:
+                    # /keep draws on this later to commit chosen parts without
+                    # anything from a brainstorm ever being applied automatically.
+                    workspace.set_last_brainstorm(chat_id, project, output)
+        elif decision.route == "claude_research":
+            # Only ever reached via /research's forced_route bypass — never
+            # selected by Ollama triage, so routine project work never risks
+            # launching a browser unexpectedly.
+            project = item.project or workspace.get_active_project(chat_id)
+            if project is None:
+                output, success = (workspace.no_active_project_message(), False)
+            else:
+                output, success = await run_research_task(
+                    query=decision.task,
+                    project=project,
+                    status_callback=status_callback,
+                    model=decision.model,
+                    chat_id=chat_id,
+                    message_id=status_message_id,
+                )
+        elif decision.route == "claude_dev":
+            # Only ever reached via /fix or /code's forced_route bypass —
+            # TriageDecision's schema excludes this route from Ollama triage.
+            output, success = await run_dev_task(
                 task=decision.task,
-                mode=book_mode,
+                mode=item.dev_mode or "fix",
                 status_callback=status_callback,
                 model=decision.model,
                 chat_id=chat_id,
                 message_id=status_message_id,
             )
-            if book_mode == "brainstorm" and success:
-                # /keep draws on this later to commit chosen parts without
-                # anything from a brainstorm ever being applied automatically.
-                book.set_last_brainstorm(chat_id, output)
         elif decision.route == "claude_general":
             approved = True
             if decision.risky:
@@ -334,6 +391,8 @@ class TaskQueue:
             f"model=`{decision.model}`\n"
             f"_{decision.rationale}_\n\n"
         )
+        if decision.route == "claude_dev" and success:
+            header += "🔄 Source changed — restart the bot for this to take effect.\n\n"
         await deliver_final_result(
             bot,
             chat_id=chat_id,

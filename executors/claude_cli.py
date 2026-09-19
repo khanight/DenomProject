@@ -246,33 +246,40 @@ async def run_claude_cli(
     chat_id: int = 0,
     message_id: int = 0,
     cwd: Optional[Path] = None,
+    allowed_root: Optional[Path] = None,
 ) -> tuple[str, bool]:
     """
-    Run `claude` inside config.SANDBOX_DIR (or a subdirectory of it), streaming
-    its live tool calls and answer text to `status_callback` (Telegram) and its
-    complete raw event feed to a pair of local log files under config.LOG_DIR
-    (human-readable .log + raw .jsonl), named from `chat_id`/`message_id`.
+    Run `claude` inside `allowed_root` (default config.SANDBOX_DIR) or a
+    subdirectory of it, streaming its live tool calls and answer text to
+    `status_callback` (Telegram) and its complete raw event feed to a pair of
+    local log files under config.LOG_DIR (human-readable .log + raw .jsonl),
+    named from `chat_id`/`message_id`.
 
     The subprocess never inherits ANTHROPIC_API_KEY from the host environment.
 
     `model` is a router.RouteDecision.model literal (e.g. "claude-sonnet")
     or a raw Claude CLI --model value; pass None to use the CLI's default.
 
-    `cwd` optionally scopes the subprocess to a subdirectory of SANDBOX_DIR
-    (e.g. the book_project/ workspace); it must resolve to SANDBOX_DIR itself
-    or a path inside it. Pass None to use SANDBOX_DIR directly.
+    `cwd` optionally scopes the subprocess to a subdirectory of `allowed_root`
+    (e.g. a projects/<name>/ workspace); it must resolve to `allowed_root`
+    itself or a path inside it. Pass None to use `allowed_root` directly.
+
+    `allowed_root` overrides the sandbox-only guard below. Only pass
+    config.PROJECT_ROOT here for the /fix and /code dev tasks
+    (executors/dev.py) — every other caller must leave this as None so
+    Claude CLI stays confined to config.SANDBOX_DIR.
 
     Returns:
         (full_output_string, success_boolean)
     """
-    sandbox = config.SANDBOX_DIR.resolve()
-    sandbox.mkdir(parents=True, exist_ok=True)
+    root = (allowed_root or config.SANDBOX_DIR).resolve()
+    root.mkdir(parents=True, exist_ok=True)
 
-    # Hard guard: never execute outside the configured sandbox cwd.
-    target_dir = (cwd or sandbox).resolve()
+    # Hard guard: never execute outside `root`.
+    target_dir = (cwd or root).resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
-    if target_dir != sandbox and sandbox not in target_dir.parents:
-        raise ValueError(f"Refusing to run Claude CLI outside SANDBOX_DIR: {target_dir}")
+    if target_dir != root and root not in target_dir.parents:
+        raise ValueError(f"Refusing to run Claude CLI outside {root}: {target_dir}")
 
     cwd_str = str(target_dir)
     env = _oauth_safe_env()

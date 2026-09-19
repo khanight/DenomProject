@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import signal
 import sys
 from typing import Optional
@@ -29,8 +30,8 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
-import book
 import config
+import workspace
 from memory import conversation_memory
 from queue_manager import TaskItem, task_queue
 
@@ -225,60 +226,26 @@ def _command_text(update: Update) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-async def _handle_fast_capture(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, command: str
+async def _enqueue_project_task(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    project: str,
+    project_mode: str,
+    payload: str,
+    target_file: Optional[str] = None,
 ) -> None:
-    """
-    /note, /char, /lore — direct, LLM-free append to a book_project/ markdown
-    file. Handled entirely in Python before any routing/LLM call.
-    """
-    if update.effective_user is None or update.message is None:
-        return
-
-    if not _is_authorized(update.effective_user.id):
-        logger.warning("Rejected unauthorized /%s attempt user_id=%s", command, update.effective_user.id)
-        try:
-            await update.message.reply_text("⛔ Unauthorized.")
-        except TelegramError:
-            pass
-        return
-
-    text = _command_text(update)
-    if not text:
-        await update.message.reply_text(f"Usage: /{command} <text>")
-        return
-
-    path, label = book.FAST_CAPTURE_TARGETS[command]
-    book.ensure_book_workspace()
-    book.append_timestamped(path, text)
-    await update.message.reply_text(f"✅ Saved to {label}")
-
-
-async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_fast_capture(update, context, "note")
-
-
-async def handle_char(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_fast_capture(update, context, "char")
-
-
-async def handle_lore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_fast_capture(update, context, "lore")
-
-
-async def _enqueue_book_task(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, book_mode: str, payload: str
-) -> None:
-    """Enqueue a claude_book task directly, bypassing Ollama triage, but still
-    serialized through the FIFO Claude CLI queue."""
-    ack = await update.message.reply_text("⏳ Queuing book task...")
+    """Enqueue a claude_project task directly, bypassing Ollama triage, but
+    still serialized through the FIFO Claude CLI queue."""
+    ack = await update.message.reply_text("⏳ Queuing task...")
 
     item = TaskItem(
         chat_id=update.effective_chat.id,
         message_id=ack.message_id,
         user_prompt=payload,
-        forced_route="claude_book",
-        book_mode=book_mode,
+        forced_route="claude_project",
+        project_mode=project_mode,
+        project=project,
+        target_file=target_file,
     )
     position = await task_queue.enqueue(item)
 
@@ -286,55 +253,217 @@ async def _enqueue_book_task(
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
             message_id=ack.message_id,
-            text=f"📖 Book task queued (Position #{position})...",
+            text=f"🧠 Task queued for project '{project}' (Position #{position})...",
         )
     except TelegramError:
         logger.exception("Failed to update queue acknowledgement")
 
 
-async def _handle_book_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, book_mode: str
-) -> None:
-    """/write, /brainstorm, /braindump — prompt text comes straight from the command."""
+async def _require_active_project(update: Update) -> Optional[str]:
+    """
+    Return the active project for this chat, or None after replying with
+    setup instructions (existing projects to switch to, or how to start a
+    new one) if none is set yet. Caller must already have validated
+    update.effective_chat/update.message are non-None.
+    """
+    project = workspace.get_active_project(update.effective_chat.id)
+    if project is None:
+        await update.message.reply_text(workspace.no_active_project_message())
+    return project
+
+
+async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /project [name] — set or show the active project for this chat. Every
+    other project command (/write, /brainstorm, /braindump, /keep, /create,
+    /list, /delete) operates on whichever project is active here. A name
+    that doesn't exist yet is created.
+    """
     if update.effective_user is None or update.effective_chat is None or update.message is None:
         return
 
     if not _is_authorized(update.effective_user.id):
-        logger.warning(
-            "Rejected unauthorized /%s attempt user_id=%s", book_mode, update.effective_user.id
-        )
+        logger.warning("Rejected unauthorized /project attempt user_id=%s", update.effective_user.id)
         try:
             await update.message.reply_text("⛔ Unauthorized.")
         except TelegramError:
             pass
         return
 
-    prompt = _command_text(update)
-    if not prompt:
-        await update.message.reply_text(f"Usage: /{book_mode} <prompt>")
+    chat_id = update.effective_chat.id
+    name = _command_text(update)
+
+    if not name:
+        current = workspace.get_active_project(chat_id)
+        projects = workspace.list_projects()
+        listing = ", ".join(projects) if projects else "(none yet)"
+        if current:
+            await update.message.reply_text(f"Active project: {current}\nAll projects: {listing}")
+        else:
+            await update.message.reply_text(workspace.no_active_project_message())
         return
 
-    await _enqueue_book_task(update, context, book_mode, prompt)
+    project_name = workspace.normalize_project_name(name)
+    if project_name is None:
+        await update.message.reply_text("Invalid project name.")
+        return
+
+    created = workspace.ensure_project(project_name)
+    workspace.set_active_project(chat_id, project_name)
+    verb = "Created and switched to" if created else "Switched to"
+    await update.message.reply_text(f"✅ {verb} project '{project_name}'.")
 
 
-async def handle_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_book_command(update, context, "write")
+async def handle_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/create <name> — create a new .md file in the active project (e.g. /create ending -> ending.md)."""
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /create attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    name = _command_text(update)
+    if not name:
+        await update.message.reply_text("Usage: /create <name> (e.g. /create ending)")
+        return
+
+    filename = workspace.normalize_md_name(name)
+    if filename is None:
+        await update.message.reply_text("Invalid file name.")
+        return
+
+    _, created = workspace.create_md_file(workspace.project_dir(project), filename)
+    if created:
+        await update.message.reply_text(f"✅ Created {filename} in '{project}'.")
+    else:
+        await update.message.reply_text(f"ℹ️ {filename} already exists in '{project}'.")
+
+
+async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/list — list all .md files in the active project."""
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /list attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    files = workspace.list_md_files(workspace.project_dir(project))
+    if not files:
+        await update.message.reply_text(f"No .md files in '{project}' yet. Use /create <name> to add one.")
+        return
+
+    listing = "\n".join(f"- {f}" for f in files)
+    await update.message.reply_text(f"Files in '{project}':\n{listing}")
+
+
+async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/delete <name> — permanently delete a .md file from the active project. No confirmation, no undo."""
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /delete attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    name = _command_text(update)
+    if not name:
+        await update.message.reply_text("Usage: /delete <name> (e.g. /delete ending)")
+        return
+
+    filename = workspace.normalize_md_name(name)
+    if filename is None:
+        await update.message.reply_text("Invalid file name.")
+        return
+
+    deleted = workspace.delete_md_file(workspace.project_dir(project), filename)
+    if deleted:
+        await update.message.reply_text(f"🗑️ Deleted {filename} from '{project}'.")
+    else:
+        await update.message.reply_text(f"{filename} doesn't exist in '{project}'.")
 
 
 async def handle_brainstorm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_book_command(update, context, "brainstorm")
+    """/brainstorm <prompt> — thinking-partner advice on the active project. Never modifies files."""
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /brainstorm attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    prompt = _command_text(update)
+    if not prompt:
+        await update.message.reply_text("Usage: /brainstorm <prompt>")
+        return
+
+    await _enqueue_project_task(update, context, project, "brainstorm", prompt)
 
 
 async def handle_braindump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_book_command(update, context, "braindump")
+    """/braindump <text> — synthesize a messy idea dump into the right file(s) in the active project."""
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /braindump attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    text = _command_text(update)
+    if not text:
+        await update.message.reply_text("Usage: /braindump <text>")
+        return
+
+    await _enqueue_project_task(update, context, project, "braindump", text)
 
 
 async def handle_keep(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /keep [guidance] — commit chosen parts of the last /brainstorm reply into
-    the book files. Nothing from a brainstorm is ever applied automatically;
-    this is the deliberate opt-in step. Optional free-text guidance narrows
-    what to keep/skip/adjust — e.g. "/keep just the bit about Toln's motive".
+    /keep [guidance] — commit chosen parts of the last /brainstorm reply (for
+    the active project) into its files. Nothing from a brainstorm is ever
+    applied automatically; this is the deliberate opt-in step. Reference the
+    brainstorm's numbers directly, e.g. "/keep 1, 3; amend 2: ...; scrap 4".
     """
     if update.effective_user is None or update.effective_chat is None or update.message is None:
         return
@@ -347,12 +476,16 @@ async def handle_keep(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
         return
 
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
     chat_id = update.effective_chat.id
-    brainstorm_text = book.get_last_brainstorm(chat_id)
+    brainstorm_text = workspace.get_last_brainstorm(chat_id, project)
     if not brainstorm_text:
         await update.message.reply_text(
-            "No recent /brainstorm reply to keep for this chat. Run /brainstorm first, "
-            "or use /braindump to add ideas directly."
+            f"No recent /brainstorm reply to keep for project '{project}'. Run /brainstorm "
+            "first, or use /braindump to add ideas directly."
         )
         return
 
@@ -363,7 +496,181 @@ async def handle_keep(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"{guidance or '(none given — use judgment: commit only concrete, decided ideas; '
         'skip speculative alternatives or open questions that were only offered as options)'}"
     )
-    await _enqueue_book_task(update, context, "keep", payload)
+    await _enqueue_project_task(update, context, project, "keep", payload)
+
+
+async def handle_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /research <query> — bridges live web research into the active project.
+    Two steps: (1) Claude browses the web (--chrome) to gather findings, (2)
+    the findings are filed into the active project's files via the same
+    synthesize-and-merge pipeline /braindump uses. Kept as its own explicit
+    command — never triggered by natural language — so routine project work
+    never risks launching a browser window unexpectedly.
+    """
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /research attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    query = _command_text(update)
+    if not query:
+        await update.message.reply_text("Usage: /research <query>")
+        return
+
+    ack = await update.message.reply_text("⏳ Queuing research task...")
+
+    item = TaskItem(
+        chat_id=update.effective_chat.id,
+        message_id=ack.message_id,
+        user_prompt=query,
+        forced_route="claude_research",
+        project=project,
+    )
+    position = await task_queue.enqueue(item)
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=ack.message_id,
+            text=f"🌐 Research task queued for project '{project}' (Position #{position})...",
+        )
+    except TelegramError:
+        logger.exception("Failed to update queue acknowledgement")
+
+
+async def handle_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /write <name> — select (creating if needed) the .md file that /write
+    continues, e.g. "/write draft" targets draft.md, then remembers it.
+    /write <prompt> — continue/extend whichever file was last selected this
+    way, appending Claude's new material to it.
+
+    Disambiguation rule: a single-word argument is always treated as a file
+    selection (even if it happens to also read like a one-word prompt);
+    anything with more than one word is always treated as a prompt.
+    """
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /write attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    chat_id = update.effective_chat.id
+    arg = _command_text(update)
+
+    if not arg:
+        current = workspace.get_active_write_file(chat_id, project)
+        files = workspace.list_md_files(workspace.project_dir(project))
+        listing = ", ".join(files) if files else "(none yet)"
+        current_line = f"Currently writing to: {current}\n" if current else ""
+        await update.message.reply_text(
+            f"{current_line}Files in '{project}': {listing}\n\n"
+            "Usage: /write <name> to select/create a file (e.g. /write draft), "
+            "then /write <prompt> to continue writing into it."
+        )
+        return
+
+    if len(arg.split()) == 1:
+        filename = workspace.normalize_md_name(arg)
+        if filename is None:
+            await update.message.reply_text("Invalid file name.")
+            return
+        _, created = workspace.create_md_file(workspace.project_dir(project), filename)
+        workspace.set_active_write_file(chat_id, project, filename)
+        verb = "Created and selected" if created else "Selected"
+        await update.message.reply_text(f"✅ {verb} {filename} — /write <prompt> now continues it.")
+        return
+
+    target = workspace.get_active_write_file(chat_id, project)
+    if target is None:
+        files = workspace.list_md_files(workspace.project_dir(project))
+        listing = ", ".join(files) if files else "(none yet)"
+        await update.message.reply_text(
+            f"No file selected to write to.\nFiles in '{project}': {listing}\n\n"
+            "Use /write <name> to select one (e.g. /write draft) — or /write <new-name> "
+            "to create and select a new one. Then /write <prompt> continues writing into it."
+        )
+        return
+
+    await _enqueue_project_task(update, context, project, "write", arg, target_file=target)
+
+
+async def _handle_dev_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, dev_mode: str
+) -> None:
+    """
+    /fix and /code — run Claude CLI directly against this bot's own source
+    tree (config.PROJECT_ROOT), bypassing Ollama triage entirely. Still
+    serialized through the same FIFO queue as every other Claude CLI task.
+    Editing source here does not hot-reload the running bot — it needs a
+    restart afterward to take effect.
+    """
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning(
+            "Rejected unauthorized /%s attempt user_id=%s", dev_mode, update.effective_user.id
+        )
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    prompt = _command_text(update)
+    if not prompt:
+        usage = "bug description" if dev_mode == "fix" else "feature description"
+        await update.message.reply_text(f"Usage: /{dev_mode} <{usage}>")
+        return
+
+    ack = await update.message.reply_text("⏳ Queuing dev task...")
+
+    item = TaskItem(
+        chat_id=update.effective_chat.id,
+        message_id=ack.message_id,
+        user_prompt=prompt,
+        forced_route="claude_dev",
+        dev_mode=dev_mode,
+    )
+    position = await task_queue.enqueue(item)
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=ack.message_id,
+            text=f"🛠️ Dev task queued (Position #{position})...",
+        )
+    except TelegramError:
+        logger.exception("Failed to update queue acknowledgement")
+
+
+async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_dev_command(update, context, "fix")
+
+
+async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_dev_command(update, context, "code")
 
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -386,6 +693,49 @@ async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else "Nothing to clear — no memory for this chat yet."
     )
     await update.message.reply_text(text)
+
+
+async def handle_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Restart the whole bot process. A fresh Python process re-imports every
+    module from disk, which is the only way source edits from /fix or /code
+    actually take effect — editing files never hot-reloads the running bot.
+
+    Any in-flight or queued task is dropped (same as /cancel) before restart.
+    """
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /restart attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    cancelled = task_queue.cancel_current()
+    drained = task_queue.clear_pending()
+    note = ""
+    if cancelled or drained:
+        dropped = []
+        if cancelled:
+            dropped.append("in-flight task")
+        if drained:
+            dropped.append(f"{drained} queued task(s)")
+        note = f" ({' and '.join(dropped)} dropped)"
+
+    logger.info("Restart requested via Telegram by user_id=%s", update.effective_user.id)
+    await update.message.reply_text(f"🔄 Restarting the bot now{note}...")
+
+    # Give the reply a moment to actually reach Telegram before this process
+    # is replaced.
+    await asyncio.sleep(1.0)
+
+    # On Windows this spawns a fresh process and exits this one immediately
+    # (verified: no lingering/zombie process) — the new process re-imports
+    # every module from disk, so code changes take effect.
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,8 +790,8 @@ async def handle_confirmation_callback(update: Update, context: ContextTypes.DEF
 async def _on_startup(application: Application) -> None:
     logger.info("Sandbox directory: %s", config.SANDBOX_DIR)
     logger.info("Allowed Telegram user IDs: %s", sorted(config.ALLOWED_USER_IDS))
-    book.ensure_book_workspace()
-    logger.info("Book project directory: %s", book.BOOK_DIR)
+    workspace.PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("Projects directory: %s", workspace.PROJECTS_DIR)
     task_queue.start(application.bot)
 
 
@@ -468,15 +818,31 @@ def build_application() -> Application:
     # Clears this chat's short-term conversation memory (routing/local-chat context).
     application.add_handler(CommandHandler("reset", handle_reset))
 
-    # Book Writing & Lore Tracker: fast-path captures append directly with no
-    # LLM involved; /write and /brainstorm enqueue a scoped Claude CLI task.
-    application.add_handler(CommandHandler("note", handle_note))
-    application.add_handler(CommandHandler("char", handle_char))
-    application.add_handler(CommandHandler("lore", handle_lore))
+    # Project Thinking Partner: /project selects the active project that all
+    # of these operate on; /create, /list, /delete manage its .md files
+    # directly (no LLM); /write, /brainstorm, /braindump, /keep each enqueue
+    # a scoped Claude CLI task.
+    application.add_handler(CommandHandler("project", handle_project))
+    application.add_handler(CommandHandler("create", handle_create))
+    application.add_handler(CommandHandler("list", handle_list))
+    application.add_handler(CommandHandler("delete", handle_delete))
     application.add_handler(CommandHandler("write", handle_write))
     application.add_handler(CommandHandler("brainstorm", handle_brainstorm))
     application.add_handler(CommandHandler("braindump", handle_braindump))
     application.add_handler(CommandHandler("keep", handle_keep))
+
+    # Web-research bridge: browses with --chrome, then files findings into
+    # the active project. Explicit-only, never triggered by natural language.
+    application.add_handler(CommandHandler("research", handle_research))
+
+    # Self-maintenance: edits this bot's own source tree directly (no Ollama
+    # triage, no Chrome). Requires a bot restart afterward to take effect.
+    application.add_handler(CommandHandler("fix", handle_fix))
+    application.add_handler(CommandHandler("code", handle_code))
+
+    # Restarts the whole bot process — needed for /fix and /code changes to
+    # take effect, and usable remotely without shell access to the machine.
+    application.add_handler(CommandHandler("restart", handle_restart))
 
     # Inline-keyboard responses to destructive-action confirmation prompts.
     application.add_handler(CallbackQueryHandler(handle_confirmation_callback))

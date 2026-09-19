@@ -60,6 +60,10 @@ def _resolve_sandbox_dir(raw: str | None) -> Path:
 
 # --- Public settings -----------------------------------------------------------------
 
+# The bot's own source tree. Only /fix and /code (executors/dev.py) ever point
+# a Claude CLI subprocess's cwd here instead of SANDBOX_DIR.
+PROJECT_ROOT: Path = _PROJECT_ROOT
+
 TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_IDS: frozenset[int] = _parse_allowed_user_ids(
     _require("TELEGRAM_ALLOWED_USER_IDS")

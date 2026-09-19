@@ -12,7 +12,7 @@ import logging
 import ollama
 
 import config
-from schemas import RouteDecision
+from schemas import RouteDecision, TriageDecision
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +29,17 @@ Routing rules:
   Prefer model "claude-opus" for complex, high-stakes, or multi-step browser
   work; "claude-sonnet" for everyday browser tasks; "claude-haiku" for simple
   lookups.
-- "claude_book": The task is manuscript writing/continuing a scene, deep story
-  brainstorming, untangling a plot blocker, or analyzing established lore/
-  characters for an ongoing novel project. Prefer "claude-opus" for complex
-  plotting or long scenes; "claude-sonnet" for everyday writing/brainstorming;
-  "claude-haiku" for quick lore lookups.
+- "claude_project": The task is thinking-partner work on the user's current
+  active project — continuing/extending notes or a document, brainstorming,
+  untangling a problem, or organizing/analyzing what's already written down.
+  This is a generic notes/writing/planning workspace, not necessarily fiction
+  — treat any "keep working on my notes/document/project" style request as
+  this route regardless of subject matter. Prefer "claude-opus" for complex
+  work or long documents; "claude-sonnet" for everyday writing/brainstorming;
+  "claude-haiku" for quick lookups.
 - "claude_general": The task is other local filesystem work, scripts, coding,
   terminal commands, or desktop-adjacent work inside the sandbox that is not
-  book/manuscript related. Prefer "claude-opus" for complex or high-stakes
+  project/notes related. Prefer "claude-opus" for complex or high-stakes
   coding/refactoring; "claude-sonnet" for everyday coding tasks; "claude-haiku"
   for simple file edits.
 
@@ -45,7 +48,7 @@ to undo — deleting or overwriting files/directories, formatting drives,
 force-pushing or resetting git history, recursive deletes, uninstalling
 software, modifying system/network settings, or anything that could cause
 data loss or system changes outside the sandbox. Otherwise set "risky": false.
-Always set "risky": false for "local", "claude_web", and "claude_book" routes.
+Always set "risky": false for "local", "claude_web", and "claude_project" routes.
 
 Write "task" as a clean, self-contained instruction for the executor.
 Write "rationale" as one short sentence explaining the choice.
@@ -60,8 +63,13 @@ async def route_command(user_message: str, history: str = "") -> RouteDecision:
     (see memory.ConversationMemory.format_for_prompt) used to disambiguate
     follow-ups like "do that again"; pass "" for a fresh chat.
 
-    Uses format=RouteDecision.model_json_schema() and temperature=0 for
-    deterministic, schema-valid JSON output.
+    Uses format=TriageDecision.model_json_schema() and temperature=0 for
+    deterministic, schema-valid JSON output. TriageDecision's route enum
+    deliberately excludes "claude_dev" (self-editing /fix and /code) at the
+    schema level, so natural-language triage can never select it — only the
+    explicit /fix and /code commands can (queue_manager.py's forced_route
+    bypass). The result is converted to the full RouteDecision type before
+    returning, since every other route is valid there too.
     """
     client = ollama.AsyncClient(host=config.OLLAMA_HOST)
 
@@ -79,12 +87,13 @@ async def route_command(user_message: str, history: str = "") -> RouteDecision:
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        format=RouteDecision.model_json_schema(),
+        format=TriageDecision.model_json_schema(),
         options={"temperature": 0},
     )
 
     raw = response["message"]["content"]
-    decision = RouteDecision.model_validate_json(raw)
+    triage = TriageDecision.model_validate_json(raw)
+    decision = RouteDecision(**triage.model_dump())
     logger.info(
         "RouteDecision route=%s model=%s rationale=%s",
         decision.route,
