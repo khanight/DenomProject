@@ -41,6 +41,9 @@ async def run_workspace_task(
                         modifying files (used by /brainstorm).
       - "braindump"  -> synthesize raw ideas into the right existing/new file(s).
       - "keep"       -> commit chosen parts of a prior /brainstorm reply.
+      - "panel"      -> moderate a discussion among the members listed in
+                        panel.md; ends in numbered takeaways so /keep works.
+      - "paneledit"  -> add/remove/change members in panel.md per a plain-words request.
       - "auto"       -> Claude decides what to do based on the request (used
                         for router-driven claude_project natural-language tasks).
     """

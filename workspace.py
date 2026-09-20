@@ -119,6 +119,36 @@ def no_active_project_message() -> str:
     )
 
 
+# --- Discussion panel (roster lives in the project as panel.md) ---
+
+PANEL_FILENAME = "panel.md"
+
+EMPTY_PANEL_MESSAGE = (
+    "The panel for this project is empty.\n\n"
+    "Use /paneledit to add members, describing what you want in plain words, e.g.:\n"
+    "/paneledit add Steve Jobs, Tony Stark and a skeptical patent lawyer\n\n"
+    "Members can be real people or fictional characters (as long as they're "
+    "well known), or generic roles/experts like \"a lawyer\" or \"a marketing strategist\"."
+)
+
+
+def panel_path(project: str) -> Path:
+    """Path to a project's panel roster file (may not exist yet)."""
+    return project_dir(project) / PANEL_FILENAME
+
+
+def panel_members(project: str) -> list[str]:
+    """Names of the panel's members, read from `## Name` headings in panel.md."""
+    path = panel_path(project)
+    if not path.is_file():
+        return []
+    members: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## ") and line[3:].strip():
+            members.append(line[3:].strip())
+    return members
+
+
 # --- Per-chat state (in-memory only, like memory.ConversationMemory — lost on restart) ---
 
 # Active project per chat.
@@ -220,8 +250,10 @@ _KEEP_TEMPLATE = """You are the organizer for this project's notes.
 
 Files currently in this project: {file_list}
 
-The user previously ran /brainstorm, which replied with a numbered list of
-distinct ideas (1. 2. 3. ...). Their guidance on what to actually commit is
+The user previously ran /brainstorm (a numbered list of distinct ideas) or
+/panel (a panel discussion that closes with a numbered list of takeaways) —
+either way, the numbers below refer to that numbered list (1. 2. 3. ...), and
+any panel back-and-forth before it is context only. Their guidance on what to actually commit is
 included below, and will typically reference those same numbers — e.g. "keep
 1, 3, 5; amend 2 to: <replacement text>; scrap 4" — meaning: commit ideas 1,
 3, and 5 as given; commit idea 2 but replaced/modified per the amendment text
@@ -296,6 +328,58 @@ below. Do NOT transcribe them verbatim. Instead:
 {task}
 """
 
+_PANEL_TEMPLATE = """You are moderating a panel discussion for this project.
+
+Files currently in this project: {file_list}
+
+1. Read panel.md — each "## Name" heading is a panel member, followed by a line
+   or two on their lens. Read the project's other files too as context. Do not
+   modify any files.
+2. The panel discusses the idea below. Members may be real well-known people,
+   fictional characters, or generic roles/experts. For a real person, channel
+   their publicly known views, priorities and communication style — never
+   invent quotes or specific statements and present them as things they
+   actually said. If a member has no lens written, infer a sensible one from
+   who or what they are.
+3. Format:
+   - **Opening takes**: each member reacts in their own voice, 2-4 sentences,
+     under a bold name label. Voices must be distinct.
+   - **Cross-talk**: members respond to each other. At least one real
+     disagreement — do not let everyone politely agree.
+   - **Moderator's takeaways**: a neutral moderator closes with a numbered
+     list (1. 2. 3. ...), one distinct, self-contained takeaway, risk or
+     recommendation per number. This is the ONLY numbered list in your reply —
+     the user will later reference these exact numbers (e.g. "keep 1, 3; scrap
+     2") to decide what gets committed to the files, so don't bundle ideas or
+     skip numbers.
+4. End with one italic line: "Simulated personas — not real statements."
+
+Idea for the panel: {task}
+"""
+
+_PANELEDIT_TEMPLATE = """You maintain the discussion panel roster for this project.
+
+Files currently in this project: {file_list}
+
+The roster lives in panel.md (create it if it doesn't exist yet). Format: one
+"## Name" heading per member, followed by one or two lines on their lens —
+what they focus on, care about, and how they'd push back on ideas.
+
+Apply the user's requested changes below to panel.md — adding, removing,
+renaming or re-describing members. Leave the other members untouched. Members
+may be real well-known people, fictional characters, or generic roles/experts
+(e.g. "Skeptical Lawyer"). For a real person, base the lens on their publicly
+known views and style. If a name is not a well-known real person or character
+and isn't clearly a role, don't guess who it is — leave it out and say so.
+Aim for at most 6 members; mention it if the result goes past that. Do not
+touch any other file.
+
+Reply with the panel's roster as it now stands (name + a few words of lens per
+member), plus one line on what changed.
+
+Requested changes: {task}
+"""
+
 _TEMPLATES = {
     "write": _WRITE_TEMPLATE,
     "brainstorm": _BRAINSTORM_TEMPLATE,
@@ -303,6 +387,8 @@ _TEMPLATES = {
     "braindump": _BRAINDUMP_TEMPLATE,
     "keep": _KEEP_TEMPLATE,
     "research": _RESEARCH_TEMPLATE,
+    "panel": _PANEL_TEMPLATE,
+    "paneledit": _PANELEDIT_TEMPLATE,
 }
 
 

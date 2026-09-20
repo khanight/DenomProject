@@ -475,6 +475,76 @@ async def handle_brainstorm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _enqueue_project_task(update, context, project, "brainstorm", prompt)
 
 
+async def handle_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /panel [idea] (alias /council) — with an idea, the project's panel of
+    personas discusses it (advice only, never modifies files; /keep can
+    commit the numbered takeaways afterward). With no argument, shows the
+    current panel roster.
+    """
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /panel attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    members = workspace.panel_members(project)
+    if not members:
+        await update.message.reply_text(workspace.EMPTY_PANEL_MESSAGE)
+        return
+
+    idea = _command_text(update)
+    if not idea:
+        roster = workspace.panel_path(project).read_text(encoding="utf-8").strip()
+        await update.message.reply_text(
+            f"Panel for '{project}' ({len(members)} members):\n\n{roster}\n\n"
+            "Use /panel <idea> to put an idea to them, or /paneledit <changes> to change who's on it."
+        )
+        return
+
+    await _enqueue_project_task(update, context, project, "panel", idea)
+
+
+async def handle_paneledit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/paneledit <changes> — add, remove or change panel members by describing the change in plain words."""
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /paneledit attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    changes = _command_text(update)
+    if not changes:
+        await update.message.reply_text(
+            "Usage: /paneledit <what to change>\n"
+            "e.g. /paneledit add Steve Jobs and a skeptical lawyer\n"
+            "or /paneledit remove Tony Stark, and make the lawyer focus on IP risk\n\n"
+            "Members can be real people or fictional characters (well known), "
+            "or generic roles like \"a lawyer\" or \"a marketing expert\"."
+        )
+        return
+
+    await _enqueue_project_task(update, context, project, "paneledit", changes)
+
+
 async def handle_braindump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/braindump <text> — synthesize a messy idea dump into the right file(s) in the active project."""
     if update.effective_user is None or update.effective_chat is None or update.message is None:
@@ -526,14 +596,14 @@ async def handle_keep(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     brainstorm_text = workspace.get_last_brainstorm(chat_id, project)
     if not brainstorm_text:
         await update.message.reply_text(
-            f"No recent /brainstorm reply to keep for project '{project}'. Run /brainstorm "
+            f"No recent /brainstorm or /panel reply to keep for project '{project}'. Run one "
             "first, or use /braindump to add ideas directly."
         )
         return
 
     guidance = _command_text(update)
     payload = (
-        f"Previous /brainstorm response:\n{brainstorm_text}\n\n"
+        f"Previous /brainstorm or /panel response:\n{brainstorm_text}\n\n"
         f"User guidance on what to keep/skip/adjust: "
         f"{guidance or '(none given — use judgment: commit only concrete, decided ideas; '
         'skip speculative alternatives or open questions that were only offered as options)'}"
@@ -737,6 +807,55 @@ async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(text)
 
 
+HELP_TEXT = (
+    "Available commands:\n"
+    "\n"
+    "General\n"
+    "/help — show this list\n"
+    "/cancel, /stop — abort the running task and clear the queue\n"
+    "/reset — clear this chat's short-term memory\n"
+    "/restart — restart the bot process\n"
+    "\n"
+    "Projects\n"
+    "/project [name] — show or select (creating if needed) the active project\n"
+    "/create <name> — create a .md file in the active project\n"
+    "/list — list the active project's .md files\n"
+    "/read <name> — send a .md file as a document\n"
+    "/delete <name> — permanently delete a .md file\n"
+    "/write <name> — select a file to write, then send text to continue it\n"
+    "/brainstorm <prompt> — thinking-partner advice (never edits files)\n"
+    "/braindump <text> — file a messy idea dump into the right file(s)\n"
+    "/panel [idea] — a panel of personas discusses your idea (never edits files); "
+    "no idea = show the panel. Alias: /council\n"
+    "/paneledit <changes> — add/remove/change panel members in plain words "
+    "(real or fictional well-known figures, or generic roles like \"a lawyer\")\n"
+    "/keep [guidance] — commit parts of the last brainstorm or panel discussion into files\n"
+    "/research <query> — browse the web and file findings into the project\n"
+    "\n"
+    "Self-maintenance\n"
+    "/fix <bug description> — fix a bug in the bot's own source\n"
+    "/code <feature description> — add a feature to the bot's own source\n"
+    "\n"
+    "Any other text is handled as a regular prompt."
+)
+
+
+async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/help — list all available commands."""
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /help attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    await update.message.reply_text(HELP_TEXT)
+
+
 async def handle_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Restart the whole bot process. A fresh Python process re-imports every
@@ -857,6 +976,9 @@ def build_application() -> Application:
     # clear the queue; auth is enforced inside the handler for clear logging.
     application.add_handler(CommandHandler(["cancel", "stop"], handle_cancel))
 
+    # Lists every available command.
+    application.add_handler(CommandHandler("help", handle_help))
+
     # Clears this chat's short-term conversation memory (routing/local-chat context).
     application.add_handler(CommandHandler("reset", handle_reset))
 
@@ -871,6 +993,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("read", handle_read))
     application.add_handler(CommandHandler("write", handle_write))
     application.add_handler(CommandHandler("brainstorm", handle_brainstorm))
+    application.add_handler(CommandHandler(["panel", "council"], handle_panel))
+    application.add_handler(CommandHandler("paneledit", handle_paneledit))
     application.add_handler(CommandHandler("braindump", handle_braindump))
     application.add_handler(CommandHandler("keep", handle_keep))
 

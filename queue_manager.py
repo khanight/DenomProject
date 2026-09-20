@@ -50,7 +50,7 @@ class TaskItem:
     # triage entirely and dispatch straight to a known route.
     forced_route: Optional[str] = None
     # Only meaningful when forced_route == "claude_project": "write",
-    # "brainstorm", "braindump", or "keep".
+    # "brainstorm", "braindump", "keep", "panel", or "paneledit".
     project_mode: Optional[str] = None
     # The project name active at enqueue time — used by both
     # forced_route == "claude_project" and "claude_research".
@@ -321,9 +321,9 @@ class TaskQueue:
                     chat_id=chat_id,
                     message_id=status_message_id,
                 )
-                if project_mode == "brainstorm" and success:
+                if project_mode in ("brainstorm", "panel") and success:
                     # /keep draws on this later to commit chosen parts without
-                    # anything from a brainstorm ever being applied automatically.
+                    # anything from a brainstorm or panel ever being applied automatically.
                     workspace.set_last_brainstorm(chat_id, project, output)
         elif decision.route == "claude_research":
             # Only ever reached via /research's forced_route bypass — never
