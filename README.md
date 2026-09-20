@@ -54,6 +54,7 @@ existing project names to switch to, or instructions to start a new one.
 | `/create <name>` | Create `<name>.md` in the active project (`.md` is added automatically — `/create ending` makes `ending.md`). No-ops with a note if it already exists. |
 | `/list` | List all `.md` files in the active project. |
 | `/delete <name>` | Permanently delete `<name>.md` from the active project. No confirmation, no undo. |
+| `/read <name>` | Send `<name>.md` from the active project as a `.txt` file. |
 
 ### Claude-assisted (queued, runs via Claude CLI in the active project's folder)
 
@@ -121,7 +122,7 @@ from a plain message — see the note in the routing table above.
 
 ## Notes on behavior
 
-- All tasks (except `/project`, `/create`, `/list`, `/delete`) run one at a
+- All tasks (except `/project`, `/create`, `/list`, `/delete`, `/read`) run one at a
   time in a strict FIFO queue — Chrome automation and Claude CLI can't run
   concurrently. You'll get a "queued at position #N" reply and then live
   status updates as it runs.

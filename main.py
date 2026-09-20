@@ -408,6 +408,48 @@ async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"{filename} doesn't exist in '{project}'.")
 
 
+async def handle_read(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/read <name> — send a .md file from the active project as a .txt document."""
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        logger.warning("Rejected unauthorized /read attempt user_id=%s", update.effective_user.id)
+        try:
+            await update.message.reply_text("⛔ Unauthorized.")
+        except TelegramError:
+            pass
+        return
+
+    project = await _require_active_project(update)
+    if project is None:
+        return
+
+    name = _command_text(update)
+    if not name:
+        await update.message.reply_text("Usage: /read <name> (e.g. /read ending)")
+        return
+
+    filename = workspace.normalize_md_name(name)
+    if filename is None:
+        await update.message.reply_text("Invalid file name.")
+        return
+
+    file_path = workspace.project_dir(project) / filename
+    if not file_path.is_file():
+        await update.message.reply_text(f"{filename} doesn't exist in '{project}'.")
+        return
+
+    txt_name = f"{file_path.stem}.txt"
+    document = io.BytesIO(file_path.read_bytes())
+    document.name = txt_name
+    try:
+        await update.message.reply_document(document=document, filename=txt_name)
+    except TelegramError:
+        logger.exception("send_document failed for /read")
+        await update.message.reply_text("Could not upload the file. Check server logs.")
+
+
 async def handle_brainstorm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/brainstorm <prompt> — thinking-partner advice on the active project. Never modifies files."""
     if update.effective_user is None or update.effective_chat is None or update.message is None:
@@ -826,6 +868,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("create", handle_create))
     application.add_handler(CommandHandler("list", handle_list))
     application.add_handler(CommandHandler("delete", handle_delete))
+    application.add_handler(CommandHandler("read", handle_read))
     application.add_handler(CommandHandler("write", handle_write))
     application.add_handler(CommandHandler("brainstorm", handle_brainstorm))
     application.add_handler(CommandHandler("braindump", handle_braindump))
